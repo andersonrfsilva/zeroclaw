@@ -13090,6 +13090,23 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Inbound peers for a Telegram alias. A chat-scoped alias (`allowed_chats`
+/// non-empty) admits every member of its chats, so it resolves to the wildcard;
+/// the channel itself drops updates from unlisted chats before authorization.
+#[cfg(feature = "channel-telegram")]
+fn telegram_peers(config: &Config, alias: &str) -> Vec<String> {
+    if config
+        .channels
+        .telegram
+        .get(alias)
+        .is_some_and(|tg| !tg.allowed_chats.is_empty())
+    {
+        vec!["*".to_string()]
+    } else {
+        config.channel_external_peers("telegram", alias)
+    }
+}
+
 #[cfg(feature = "channel-slack")]
 fn slack_thread_context_max_messages_resolver(
     config_arc: &zeroclaw_config::live::LiveConfigHandle,
@@ -13162,7 +13179,7 @@ fn build_channel_by_id(
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
                 let cfg_arc = config_arc.clone();
                 let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
+                Arc::new(move || telegram_peers(&cfg_arc.read(), &alias))
             };
             let workspace_dir = one_shot_channel_workspace_dir(&config, "telegram", &alias);
             let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
@@ -13190,6 +13207,8 @@ fn build_channel_by_id(
                 .with_tts(&config)
                 .with_workspace_dir(workspace_dir)
                 .with_per_user_session(tg.per_user_session)
+                .with_allowed_chats(tg.allowed_chats.clone())
+                .with_commands_enabled(tg.commands_enabled)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
         }
@@ -14738,7 +14757,7 @@ fn collect_configured_channels_with_authority(
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
             let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("telegram", &alias))
+            Arc::new(move || telegram_peers(&cfg_arc.read(), &alias))
         };
         let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
             let cfg_arc = config_arc.clone();
@@ -14771,6 +14790,8 @@ fn collect_configured_channels_with_authority(
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())
                     .with_per_user_session(tg.per_user_session)
+                    .with_allowed_chats(tg.allowed_chats.clone())
+                    .with_commands_enabled(tg.commands_enabled)
                     .with_approval_timeout_secs(tg.approval_timeout_secs),
                 ),
                 tg,
@@ -53134,6 +53155,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_chats: vec![],
+                commands_enabled: true,
             },
         );
         let config_arc = zeroclaw_config::live::LiveConfig::new(config).handle();
@@ -53166,6 +53189,8 @@ This is an example JSON object for profile settings."#;
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
                 debounce_ms: None,
+                allowed_chats: vec![],
+                commands_enabled: true,
             },
         );
         config

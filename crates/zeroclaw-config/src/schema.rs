@@ -16854,6 +16854,20 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default = "default_true")]
     pub per_user_session: bool,
+    /// Chat IDs (group, supergroup or private) this bot serves. When non-empty,
+    /// every update from another chat is dropped silently, every member of a
+    /// listed chat is authorized, and first-user pairing is disabled. Empty
+    /// (default) keeps sender-based peer-group authorization.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub allowed_chats: Vec<String>,
+    /// When `false`, the bot registers no command menu with Telegram (any
+    /// existing menu is deleted at startup) and silently drops every message
+    /// that starts with `/`, including runtime commands such as `/model`,
+    /// `/config` and `/new`. Default: `true`.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub commands_enabled: bool,
     /// When true in Telegram group chats, unaddressed messages that pass
     /// sender/chat authorization are recorded as passive conversation context
     /// without starting an agent turn. Lets the bot follow the discussion and
@@ -16923,6 +16937,8 @@ impl Default for TelegramConfig {
             interrupt_on_new_message: false,
             mention_only: false,
             per_user_session: true,
+            allowed_chats: Vec::new(),
+            commands_enabled: true,
             passive_group_context: false,
             ack_reactions: None,
             proxy_url: None,

@@ -987,6 +987,12 @@ pub struct TelegramChannel {
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
     per_user_session: bool,
+    /// Chat allowlist; non-empty means chat-scoped authorization. See
+    /// `with_allowed_chats`.
+    allowed_chats: Vec<String>,
+    /// When `false`, no command menu is registered and `/`-prefixed messages
+    /// are dropped. See `with_commands_enabled`.
+    commands_enabled: bool,
     passive_group_context: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
@@ -2609,6 +2615,8 @@ impl TelegramChannel {
             typing_handle: Mutex::new(None),
             mention_only,
             per_user_session: true,
+            allowed_chats: Vec::new(),
+            commands_enabled: true,
             passive_group_context: false,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
@@ -2686,6 +2694,39 @@ impl TelegramChannel {
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
         self
+    }
+
+    /// Restrict the bot to these chat IDs. Updates from any other chat are
+    /// dropped before parsing; members of a listed chat need no peer entry
+    /// (the orchestrator resolves peers to `"*"` for such a channel).
+    pub fn with_allowed_chats(mut self, chats: Vec<String>) -> Self {
+        self.allowed_chats = chats;
+        self
+    }
+
+    /// When `false`, delete the Telegram command menu at startup instead of
+    /// registering it, and drop every inbound text that starts with `/`.
+    pub fn with_commands_enabled(mut self, enabled: bool) -> Self {
+        self.commands_enabled = enabled;
+        self
+    }
+
+    /// Chat ID of the update's message (plain, edited, or the message a
+    /// callback query was attached to).
+    fn update_chat_id(update: &serde_json::Value) -> Option<i64> {
+        ["/message/chat/id", "/edited_message/chat/id", "/callback_query/message/chat/id"]
+            .iter()
+            .find_map(|p| update.pointer(p).and_then(serde_json::Value::as_i64))
+    }
+
+    /// Chat-scoped admission: with `allowed_chats` set, only updates whose
+    /// chat is listed pass; an update without a chat is rejected too.
+    fn is_chat_allowed(&self, update: &serde_json::Value) -> bool {
+        self.allowed_chats.is_empty()
+            || Self::update_chat_id(update).is_some_and(|id| {
+                let id = id.to_string();
+                self.allowed_chats.iter().any(|c| c.trim() == id)
+            })
     }
 
     /// Conversation scope for an inbound Telegram message: room-scoped for
@@ -3742,6 +3783,44 @@ impl TelegramChannel {
 
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
+    }
+
+    /// Remove the bot's command menu via `deleteMyCommands` (default scope).
+    /// Used instead of `register_bot_commands` when `commands_enabled = false`,
+    /// so a menu left by an earlier run does not survive a restart.
+    async fn delete_bot_commands(&self) {
+        let url = self.api_url("deleteMyCommands");
+        match self.http_client().post(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "Telegram bot command menu deleted (commands_enabled = false)"
+                );
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"status": status.to_string(), "text": text})
+                        ),
+                    "Failed to delete Telegram bot command menu"
+                );
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                    "Failed to delete Telegram bot command menu"
+                );
+            }
+        }
     }
 
     /// Register the bot's slash commands with Telegram via `setMyCommands`.
@@ -5803,6 +5882,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             text.to_string()
         };
 
+        // Same test the orchestrator's `parse_runtime_command` applies, so a
+        // disabled command never reaches it; an `@mention` before the slash
+        // was never a command.
+        if !self.commands_enabled && content.trim_start().starts_with('/') {
+            return None;
+        }
+
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
         } else {
@@ -7080,6 +7166,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         transient_retry: &mut Option<(i64, u32)>,
     ) -> UpdateOutcome {
         let uid = update.get("update_id").and_then(serde_json::Value::as_i64);
+
+        // Chat-scoped admission precedes every parser and callback handler:
+        // an update from an unlisted chat is acknowledged and forgotten.
+        if !self.is_chat_allowed(update) {
+            if uid.is_some() {
+                *transient_retry = None;
+            }
+            return UpdateOutcome::Advanced;
+        }
 
         // ── Handle callback_query (inline keyboard taps) ──
         if let Some(cb) = update.get("callback_query") {
@@ -8370,7 +8465,11 @@ impl Channel for TelegramChannel {
             "Startup probe succeeded; entering main long-poll loop."
         );
 
-        self.register_bot_commands().await;
+        if self.commands_enabled {
+            self.register_bot_commands().await;
+        } else {
+            self.delete_bot_commands().await;
+        }
 
         loop {
             if self.mention_only {
@@ -16707,6 +16806,82 @@ mod tests {
             .parse_update_message(&mention_only_update)
             .expect("mention-only body admits");
         assert_eq!(parsed.content, "@mybot");
+    }
+
+    #[test]
+    fn commands_disabled_drops_slash_text_but_keeps_mentioned_slash() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_commands_enabled(false);
+        let msg = |text: &str| {
+            serde_json::json!({
+                "update_id": 1,
+                "message": {
+                    "message_id": 1,
+                    "text": text,
+                    "from": { "id": 555, "username": "alice" },
+                    "chat": { "id": 100, "type": "private" }
+                }
+            })
+        };
+
+        assert!(ch.parse_update_message(&msg("/config")).is_none());
+        assert!(ch.parse_update_message(&msg("/model@mybot gpt")).is_none());
+        assert!(ch.parse_update_message(&msg("  /new")).is_none());
+        // Not a command for the orchestrator either: the slash is not leading.
+        let parsed = ch
+            .parse_update_message(&msg("@mybot /config"))
+            .expect("mention-prefixed text is ordinary content");
+        assert_eq!(parsed.content, "@mybot /config");
+        assert!(ch.parse_update_message(&msg("hello")).is_some());
+
+        let default_ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert!(default_ch.parse_update_message(&msg("/config")).is_some());
+    }
+
+    #[test]
+    fn allowed_chats_gates_by_chat_id_across_update_shapes() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_allowed_chats(vec![" -100200300 ".into()]);
+
+        let in_group = serde_json::json!({ "message": { "chat": { "id": -100_200_300 } } });
+        let other_group = serde_json::json!({ "message": { "chat": { "id": -100_999 } } });
+        let dm = serde_json::json!({ "message": { "chat": { "id": 555, "type": "private" } } });
+        let edited = serde_json::json!({ "edited_message": { "chat": { "id": -100_200_300 } } });
+        let callback = serde_json::json!({
+            "callback_query": { "message": { "chat": { "id": 555 } } }
+        });
+        let no_chat = serde_json::json!({ "update_id": 7 });
+
+        assert!(ch.is_chat_allowed(&in_group));
+        assert!(ch.is_chat_allowed(&edited));
+        assert!(!ch.is_chat_allowed(&other_group));
+        assert!(!ch.is_chat_allowed(&dm));
+        assert!(!ch.is_chat_allowed(&callback));
+        assert!(!ch.is_chat_allowed(&no_chat));
+
+        let open = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert!(open.is_chat_allowed(&dm));
+        assert!(open.is_chat_allowed(&no_chat));
     }
 
     #[test]
