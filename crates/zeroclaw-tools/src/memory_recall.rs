@@ -57,8 +57,9 @@ impl Tool for MemoryRecallTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-        let since = args.get("since").and_then(|v| v.as_str());
-        let until = args.get("until").and_then(|v| v.as_str());
+        // Some models fill every optional string with "" instead of omitting it; treat blank as absent.
+        let since = args.get("since").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
+        let until = args.get("until").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty());
 
         // Validate date strings
         if let Some(s) = since
@@ -375,6 +376,21 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(result.output.contains("Found 1"));
+        assert!(result.output.contains("Rust"));
+    }
+
+    #[tokio::test]
+    async fn recall_blank_dates_are_ignored() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("lang", "User prefers Rust", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        let tool = MemoryRecallTool::new(mem);
+        let result = tool
+            .execute(json!({"query": "*", "since": "", "until": " ", "limit": 5}))
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("Rust"));
     }
 
